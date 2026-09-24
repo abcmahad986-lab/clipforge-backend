@@ -1,0 +1,77 @@
+import os
+import subprocess
+import uuid
+from fastapi import FastAPI, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+app = FastAPI()
+
+# Allow Next.js frontend to talk to this API
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Store job statuses in memory
+jobs = {}
+
+class VideoRequest(BaseModel):
+    url: str
+
+def process_video_task(job_id: str, video_url: str):
+    try:
+        jobs[job_id] = {"status": "downloading", "progress": 20}
+        
+        # 1. Download YouTube Video using yt-dlp
+        input_filename = f"{job_id}_input.mp4"
+        output_filename = f"{job_id}_short.mp4"
+        
+        ydl_cmd = [
+            "yt-dlp",
+            "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+            "-o", input_filename,
+            video_url
+        ]
+        subprocess.run(ydl_cmd, check=True)
+        
+        jobs[job_id] = {"status": "cropping", "progress": 60}
+        
+        # 2. Crop video to 9:16 (Vertical Short) using FFmpeg
+        ffmpeg_cmd = [
+            "ffmpeg", "-y",
+            "-i", input_filename,
+            "-vf", "crop=ih*(9/16):ih",  # Cuts video to center 9:16
+            "-t", "30",                 # Trims first 30 seconds
+            "-c:a", "copy",
+            output_filename
+        ]
+        subprocess.run(ffmpeg_cmd, check=True)
+        
+        # Clean up original downloaded file
+        if os.path.exists(input_filename):
+            os.remove(input_filename)
+            
+        jobs[job_id] = {
+            "status": "completed",
+            "progress": 100,
+            "video_url": f"/download/{output_filename}"
+        }
+    except Exception as e:
+        jobs[job_id] = {"status": "failed", "error": str(e)}
+
+@app.post("/api/process")
+async def process_video(req: VideoRequest, background_tasks: BackgroundTasks):
+    job_id = str(uuid.uuid4())[:8]
+    jobs[job_id] = {"status": "queued", "progress": 0}
+    
+    # Run heavy processing in the background
+    background_tasks.add_task(process_video_task, job_id, req.url)
+    
+    return {"jobId": job_id}
+
+@app.get("/api/status/{job_id}")
+async def get_status(job_id: str):
+    return jobs.get(job_id, {"status": "not_found"})
